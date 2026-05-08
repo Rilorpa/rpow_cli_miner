@@ -228,6 +228,7 @@ class RpowClient {
   async request(method, urlOrPath, body, options = {}) {
     const url = assertSafeUrl(urlOrPath, this.apiOrigin);
     const maxRetries = options.maxRetries ?? this.maxRetries;
+    const maxRetryDelayMs = Number(options.maxRetryDelayMs || 30000);
     let attempt = 0;
     while (true) {
       attempt += 1;
@@ -304,7 +305,7 @@ class RpowClient {
         }
         const retryable = err.retryable || isTransientNetworkError(err);
         if (!retryable || attempt > maxRetries) throw err;
-        const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
+        const backoff = Math.min(maxRetryDelayMs, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
         const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
         log("warn", `request failed, retrying in ${delay}ms`, {
           method,
@@ -743,7 +744,7 @@ async function main() {
     const workers = Number(args.workers || defaultWorkerCount());
     const engine = args.engine || (nativeMinerPath() ? "native" : "node");
     const logEveryMs = Number(args["log-every-ms"] || (engine === "native" ? 1000 : 5000));
-    const miningRequestOptions = { maxRetries: Infinity };
+    const miningRequestOptions = { maxRetries: Infinity, maxRetryDelayMs: 5000 };
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node"].includes(engine)) throw new Error("--engine must be native or node");
     let minted = 0;

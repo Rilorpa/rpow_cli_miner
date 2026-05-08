@@ -265,7 +265,7 @@ node rpow-cli.js ledger --timeout 10000
 
 Number of retries for transient failures: timeout, `429`, `408`, `425`, `5xx`. Default: `5`.
 
-For `mine` and `run`, transient API failures are retried forever so the process keeps going until the requested mint count is reached or a non-retryable error occurs.
+For `mine` and `run`, transient API failures are retried forever with a shorter retry cap of about 5 seconds, so the process keeps going until the requested mint count is reached or a non-retryable error occurs.
 
 ```powershell
 node rpow-cli.js mine --retries 8
@@ -369,7 +369,7 @@ mining hashes=... nonce=... workers=8 engine=native speed="21.00 MH/s"
 
 ## Retry and Resume Behavior
 
-The CLI retries transient request failures with exponential backoff and jitter. During `mine` and `run`, retryable API failures are retried forever so temporary aborts, timeouts and `5xx` responses do not stop a long minting run.
+The CLI retries transient request failures with exponential backoff and jitter. During `mine` and `run`, retryable API failures are retried forever with a short retry cap of about 5 seconds, so temporary aborts, timeouts and `5xx` responses do not stop a long minting run.
 
 `POST /auth/request` is handled conservatively: on rate limit, the CLI stops and asks you to wait instead of spamming email requests.
 
