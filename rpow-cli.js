@@ -227,6 +227,7 @@ class RpowClient {
 
   async request(method, urlOrPath, body, options = {}) {
     const url = assertSafeUrl(urlOrPath, this.apiOrigin);
+    const maxRetries = options.maxRetries ?? this.maxRetries;
     let attempt = 0;
     while (true) {
       attempt += 1;
@@ -302,7 +303,7 @@ class RpowClient {
           throw e;
         }
         const retryable = err.retryable || isTransientNetworkError(err);
-        if (!retryable || attempt > this.maxRetries) throw err;
+        if (!retryable || attempt > maxRetries) throw err;
         const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
         const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
         log("warn", `request failed, retrying in ${delay}ms`, {
@@ -742,17 +743,18 @@ async function main() {
     const workers = Number(args.workers || defaultWorkerCount());
     const engine = args.engine || (nativeMinerPath() ? "native" : "node");
     const logEveryMs = Number(args["log-every-ms"] || (engine === "native" ? 1000 : 5000));
+    const miningRequestOptions = { maxRetries: Infinity };
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node"].includes(engine)) throw new Error("--engine must be native or node");
     let minted = 0;
-    await client.api("GET", "/me");
+    await client.api("GET", "/me", undefined, miningRequestOptions);
     while (minted < target) {
       let challenge = client.state.challenge;
       const challengeExpiresAt = challenge?.expires_at ? Date.parse(challenge.expires_at) : null;
       const challengeExpired = Number.isFinite(challengeExpiresAt) && Date.now() >= challengeExpiresAt - 5000;
       if (!challenge || challengeExpired || client.state.mining?.challenge_id !== challenge.challenge_id || args.fresh) {
         if (challengeExpired) log("warn", "saved challenge expired; requesting a fresh one", { challenge_id: challenge.challenge_id });
-        challenge = await client.api("POST", "/challenge");
+        challenge = await client.api("POST", "/challenge", undefined, miningRequestOptions);
         client.state.challenge = challenge;
         client.state.mining = { challenge_id: challenge.challenge_id, nonce: "0", hashes: "0", difficulty_bits: challenge.difficulty_bits };
         client.save();
@@ -788,7 +790,7 @@ async function main() {
         const result = await client.api("POST", "/mint", {
           challenge_id: challenge.challenge_id,
           solution_nonce: solution.solution_nonce,
-        });
+        }, miningRequestOptions);
         minted += 1;
         client.state.last_mint = result;
         client.state.challenge = null;
