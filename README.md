@@ -26,6 +26,61 @@ node rpow-cli.js complete-login --link "https://..." --state .rpow-a.json
 node rpow-cli.js mine --count 1000 --engine gpu --state .rpow-a.json
 ```
 
+## Windows GPU setup
+
+1. Install Node.js 18+ and confirm it works:
+
+```powershell
+node -v
+```
+
+2. Make sure your GPU driver is installed with OpenCL support.
+
+- NVIDIA: standard GeForce or Studio driver is usually enough.
+- AMD: install the normal Adrenalin driver.
+
+3. Build the GPU miner:
+
+```powershell
+.\build-gpu.ps1
+```
+
+4. Request a magic link:
+
+```powershell
+node rpow-cli.js login --email you@example.com --state .rpow-a.json
+```
+
+5. Complete login with the link from your email:
+
+```powershell
+node rpow-cli.js complete-login --link "https://..." --state .rpow-a.json
+```
+
+6. Start GPU mining:
+
+```powershell
+node rpow-cli.js mine --count 1000 --engine gpu --state .rpow-a.json
+```
+
+7. Optional tuning example for stronger GPUs:
+
+```powershell
+node rpow-cli.js mine --count 1000 --engine gpu --state .rpow-a.json --workers 16 --gpu-batch 2097152 --gpu-local-size 256
+```
+
+If the GPU binary does not start, test it directly:
+
+```powershell
+.\rpow-gpu-miner.exe --prefix 00 --difficulty 1 --batch-size 1024 --local-size 64
+```
+
+If GPU mining is unavailable, use CPU fallback:
+
+```powershell
+node rpow-cli.js mine --count 1000 --engine native --workers 8 --state .rpow-a.json
+```
+
 ## GPU example
 
 ```powershell
