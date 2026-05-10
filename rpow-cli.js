@@ -3,14 +3,10 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
-const http = require("http");
-const https = require("https");
-const net = require("net");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const { spawn } = require("child_process");
-const tls = require("tls");
 const { Worker } = require("worker_threads");
 
 const DEFAULT_SITE_ORIGIN = "https://rpow2.com";
@@ -114,22 +110,17 @@ function looksLikeProviderRateLimit(err) {
     || /too many requests|rate limit|try again/i.test(err.message || "");
 }
 
+function isChallengeRequest(method, url) {
+  return method === "POST" && url.pathname === "/challenge";
+}
+
 function errorCode(err) {
   return err?.code || err?.cause?.code || err?.cause?.cause?.code;
 }
 
-function isAbortLikeError(err) {
-  const code = errorCode(err);
-  return err?.name === "AbortError"
-    || code === 20
-    || code === "20"
-    || err?.message === "This operation was aborted"
-    || /aborted/i.test(err?.message || "");
-}
-
 function isTransientNetworkError(err) {
   const code = errorCode(err);
-  return isAbortLikeError(err)
+  return err?.name === "AbortError"
     || err?.message === "fetch failed"
     || [
       "ECONNRESET",
@@ -143,6 +134,33 @@ function isTransientNetworkError(err) {
       "UND_ERR_BODY_TIMEOUT",
       "UND_ERR_SOCKET",
     ].includes(code);
+}
+
+function isRecoverableMineError(err) {
+  return err?.retryable
+    || isTransientNetworkError(err)
+    || [408, 425, 429, 500, 502, 503, 504].includes(err?.status);
+}
+
+function cooldownDelayMs(err) {
+  const message = err?.message || "";
+  const secondsMatch = /\bwait\s+(\d+(?:\.\d+)?)s\b/i.exec(message);
+  if (secondsMatch) return Math.ceil(Number(secondsMatch[1]) * 1000) + 250;
+  const plainSecondsMatch = /\bwait\s+(\d+(?:\.\d+)?)\s+seconds?\b/i.exec(message);
+  if (plainSecondsMatch) return Math.ceil(Number(plainSecondsMatch[1]) * 1000) + 250;
+  return null;
+}
+
+function mineRetryDelayMs(failures, err) {
+  const cooldownMs = cooldownDelayMs(err);
+  if (err?.status === 429 && err?.code === "COOLDOWN" && cooldownMs) return cooldownMs;
+  const retryAfter = Math.min(err?.retryAfterMs || 0, 15000);
+  const backoff = Math.min(15000, 1000 * 2 ** Math.max(0, failures - 1));
+  return Math.max(backoff, retryAfter || 0, 1000) + Math.floor(Math.random() * 250);
+}
+
+function postMintDelayMs() {
+  return 5000 + Math.floor(Math.random() * 350);
 }
 
 function loadState(file) {
@@ -245,230 +263,6 @@ function responseSetCookies(headers) {
   return single ? [single] : [];
 }
 
-function parseProxySpec(spec) {
-  if (!spec) return null;
-  if (/^https?:\/\//i.test(spec)) {
-    const url = new URL(spec);
-    return {
-      protocol: url.protocol,
-      host: url.hostname,
-      port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-      username: decodeURIComponent(url.username || ""),
-      password: decodeURIComponent(url.password || ""),
-    };
-  }
-  const at = spec.indexOf("@");
-  const colon = spec.indexOf(":");
-  if (at <= 0 || colon <= 0 || colon > at) {
-    throw new Error(`bad proxy format: ${spec}`);
-  }
-  const host = spec.slice(0, colon);
-  const port = Number(spec.slice(colon + 1, at));
-  const creds = spec.slice(at + 1);
-  const credSep = creds.indexOf(":");
-  if (!host || !Number.isInteger(port) || port < 1 || credSep < 0) {
-    throw new Error(`bad proxy format: ${spec}`);
-  }
-  return {
-    protocol: "http:",
-    host,
-    port,
-    username: creds.slice(0, credSep),
-    password: creds.slice(credSep + 1),
-  };
-}
-
-function proxyLabel(proxy) {
-  return proxy ? `${proxy.host}:${proxy.port}` : null;
-}
-
-function proxyAuthHeader(proxy) {
-  if (!proxy?.username && !proxy?.password) return null;
-  return `Basic ${Buffer.from(`${proxy.username || ""}:${proxy.password || ""}`, "utf8").toString("base64")}`;
-}
-
-function makeHeadersBag(headers) {
-  const map = new Map();
-  for (const [key, value] of Object.entries(headers || {})) {
-    map.set(key.toLowerCase(), value);
-  }
-  return {
-    get(name) {
-      const value = map.get(String(name).toLowerCase());
-      if (Array.isArray(value)) return value.join(", ");
-      return value ?? null;
-    },
-    getSetCookie() {
-      const value = map.get("set-cookie");
-      if (!value) return [];
-      return Array.isArray(value) ? value : [value];
-    },
-  };
-}
-
-function responseFromIncomingMessage(res, bodyText) {
-  return {
-    status: res.statusCode || 0,
-    statusText: res.statusMessage || "",
-    ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
-    headers: makeHeadersBag(res.headers),
-    text: async () => bodyText,
-  };
-}
-
-function connectHttpsTunnel(url, proxy, signal) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect(proxy.port, proxy.host);
-    let settled = false;
-    let buffer = Buffer.alloc(0);
-    const auth = proxyAuthHeader(proxy);
-
-    function fail(err) {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(err);
-    }
-
-    function cleanup() {
-      socket.removeAllListeners("connect");
-      socket.removeAllListeners("data");
-      socket.removeAllListeners("error");
-      socket.removeAllListeners("close");
-      signal?.removeEventListener?.("abort", onAbort);
-    }
-
-    function onAbort() {
-      const err = new Error("This operation was aborted");
-      err.name = "AbortError";
-      err.code = 20;
-      fail(err);
-    }
-
-    socket.once("error", fail);
-    socket.once("close", () => {
-      if (!settled) fail(new Error("proxy tunnel closed before CONNECT completed"));
-    });
-    socket.once("connect", () => {
-      const lines = [
-        `CONNECT ${url.hostname}:${url.port || 443} HTTP/1.1`,
-        `Host: ${url.hostname}:${url.port || 443}`,
-        "Proxy-Connection: keep-alive",
-        "Connection: keep-alive",
-      ];
-      if (auth) lines.push(`Proxy-Authorization: ${auth}`);
-      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-    });
-    socket.on("data", (chunk) => {
-      if (settled) return;
-      buffer = Buffer.concat([buffer, chunk]);
-      const end = buffer.indexOf("\r\n\r\n");
-      if (end < 0) return;
-      const head = buffer.slice(0, end).toString("utf8");
-      const [statusLine] = head.split("\r\n");
-      const match = /^HTTP\/1\.\d\s+(\d+)/i.exec(statusLine);
-      if (!match) return fail(new Error(`bad proxy CONNECT response: ${statusLine}`));
-      const status = Number(match[1]);
-      if (status !== 200) return fail(new Error(`proxy CONNECT failed with HTTP ${status}`));
-      settled = true;
-      cleanup();
-      socket.removeAllListeners("data");
-      const leftover = buffer.slice(end + 4);
-      const secureSocket = tls.connect({
-        socket,
-        servername: url.hostname,
-      });
-      if (leftover.length > 0) secureSocket.unshift(leftover);
-      secureSocket.once("error", reject);
-      secureSocket.once("secureConnect", () => resolve(secureSocket));
-    });
-    signal?.addEventListener?.("abort", onAbort, { once: true });
-  });
-}
-
-function nodeRequest(url, { method, headers, body, signal, proxy }) {
-  return new Promise(async (resolve, reject) => {
-    let req;
-    let settled = false;
-
-    function fail(err) {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener?.("abort", onAbort);
-      reject(err);
-    }
-
-    function succeed(value) {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener?.("abort", onAbort);
-      resolve(value);
-    }
-
-    function attachResponse(reqInstance) {
-      req = reqInstance;
-      req.on("error", fail);
-      req.on("response", (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          succeed(responseFromIncomingMessage(res, Buffer.concat(chunks).toString("utf8")));
-        });
-        res.on("error", fail);
-      });
-      if (body !== undefined) req.write(body);
-      req.end();
-    }
-
-    function onAbort() {
-      const err = new Error("This operation was aborted");
-      err.name = "AbortError";
-      err.code = 20;
-      req?.destroy(err);
-      fail(err);
-    }
-
-    signal?.addEventListener?.("abort", onAbort, { once: true });
-    try {
-      if (!proxy) {
-        const transport = url.protocol === "https:" ? https : http;
-        attachResponse(transport.request(url, { method, headers }));
-        return;
-      }
-
-      const auth = proxyAuthHeader(proxy);
-      if (url.protocol === "http:") {
-        const proxyHeaders = { ...headers, host: url.host };
-        if (auth) proxyHeaders["proxy-authorization"] = auth;
-        attachResponse(http.request({
-          host: proxy.host,
-          port: proxy.port,
-          method,
-          path: url.href,
-          headers: proxyHeaders,
-        }));
-        return;
-      }
-
-      const secureSocket = await connectHttpsTunnel(url, proxy, signal);
-      attachResponse(https.request({
-        host: url.hostname,
-        port: Number(url.port || 443),
-        path: `${url.pathname}${url.search}`,
-        method,
-        headers: {
-          ...headers,
-          host: url.host,
-        },
-        agent: false,
-        createConnection: () => secureSocket,
-      }));
-    } catch (err) {
-      fail(err);
-    }
-  });
-}
-
 class RpowClient {
   constructor(options) {
     this.apiOrigin = options.apiOrigin;
@@ -477,7 +271,6 @@ class RpowClient {
     this.state = loadState(this.stateFile);
     this.timeoutMs = Number(options.timeoutMs || 20000);
     this.maxRetries = Number(options.retries || 5);
-    this.proxy = parseProxySpec(options.proxy || process.env.RPOW_PROXY || "");
   }
 
   save() {
@@ -495,10 +288,18 @@ class RpowClient {
       const started = Date.now();
       try {
         const headers = {
-          "accept": "application/json, text/plain, */*",
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9,ru;q=0.8",
           "origin": this.siteOrigin,
+          "priority": "u=1, i",
           "referer": `${this.siteOrigin}/`,
-          "user-agent": "rpow-cli/1.0",
+          "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": '"Windows"',
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-site",
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         };
         const cookies = cookieHeader(this.state.cookies);
         if (cookies) headers.cookie = cookies;
@@ -513,17 +314,14 @@ class RpowClient {
           attempt,
           has_body: body !== undefined,
           has_cookie: Boolean(headers.cookie),
-          proxy: proxyLabel(this.proxy),
         });
-        const res = this.proxy
-          ? await nodeRequest(url, { method, headers, body: payload, signal: controller.signal, proxy: this.proxy })
-          : await fetch(url, {
-            method,
-            headers,
-            body: payload,
-            redirect: options.redirect || "manual",
-            signal: controller.signal,
-          });
+        const res = await fetch(url, {
+          method,
+          headers,
+          body: payload,
+          redirect: options.redirect || "manual",
+          signal: controller.signal,
+        });
         storeSetCookies(this.state, responseSetCookies(res.headers));
         this.save();
         const text = await res.text();
@@ -536,7 +334,6 @@ class RpowClient {
           ms: Date.now() - started,
           set_cookie: responseSetCookies(res.headers).length > 0,
           retry_after_ms: retryAfterMs(res.headers),
-          proxy: proxyLabel(this.proxy),
         });
         if (res.status === 401 && options.allowUnauthorized !== true) {
           const err = new Error(parsed?.message || "login required");
@@ -567,8 +364,13 @@ class RpowClient {
         }
         const retryable = err.retryable || isTransientNetworkError(err);
         if (!retryable || attempt > this.maxRetries) throw err;
-        const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
-        const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
+        const challengeCooldown = isChallengeRequest(method, url) && err?.status === 429 && err?.code === "COOLDOWN";
+        const backoff = challengeCooldown
+          ? 5000
+          : Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
+        const delay = challengeCooldown
+          ? Math.max(5000, Math.min(err.retryAfterMs || 0, 60000))
+          : Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
         log("warn", `request failed, retrying in ${delay}ms`, {
           method,
           url: safeUrlForLog(url),
@@ -1058,7 +860,6 @@ async function main() {
     stateFile: args.state || DEFAULT_STATE,
     timeoutMs: args.timeout || 20000,
     retries: args.retries || 5,
-    proxy: args.proxy,
   });
 
   if (command === "map") {
@@ -1123,18 +924,21 @@ async function main() {
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node", "gpu"].includes(engine)) throw new Error("--engine must be native, gpu or node");
     let minted = 0;
+    let consecutiveRecoverableFailures = 0;
     while (true) {
       try {
         await client.api("GET", "/me");
+        consecutiveRecoverableFailures = 0;
         break;
       } catch (err) {
-        if (err.code === "UNAUTHORIZED") throw err;
-        if (!(err.retryable || isTransientNetworkError(err))) throw err;
-        const delay = Math.max(5000, Math.min(Number(err.retryAfterMs || 0) || 0, 60000));
-        log("warn", "startup request failed; waiting before retrying mine loop", {
+        if (err.code === "UNAUTHORIZED" || !isRecoverableMineError(err)) throw err;
+        consecutiveRecoverableFailures += 1;
+        const delay = mineRetryDelayMs(consecutiveRecoverableFailures, err);
+        log("warn", `temporary /me failure; continuing in ${delay}ms`, {
+          failures: consecutiveRecoverableFailures,
+          status: err.status,
           code: errorCode(err),
           error: err.message,
-          delay_ms: delay,
         });
         await sleep(delay);
       }
@@ -1147,17 +951,20 @@ async function main() {
         if (challengeExpired) log("warn", "saved challenge expired; requesting a fresh one", { challenge_id: challenge.challenge_id });
         try {
           challenge = await client.api("POST", "/challenge");
+          consecutiveRecoverableFailures = 0;
         } catch (err) {
-          if (err.code === "UNAUTHORIZED") throw err;
-          if (!(err.retryable || isTransientNetworkError(err))) throw err;
-          const delay = Math.max(5000, Math.min(Number(err.retryAfterMs || 0) || 0, 60000));
-          log("warn", "challenge request exhausted retries; mine loop will pause and retry", {
+          if (err.code === "UNAUTHORIZED" || !isRecoverableMineError(err)) throw err;
+          consecutiveRecoverableFailures += 1;
+          const delay = mineRetryDelayMs(consecutiveRecoverableFailures, err);
+          log("warn", `temporary challenge failure; continuing in ${delay}ms`, {
+            failures: consecutiveRecoverableFailures,
+            minted,
+            target,
+            remaining: Math.max(0, target - minted),
+            status: err.status,
             code: errorCode(err),
             error: err.message,
-            delay_ms: delay,
           });
-          client.state.challenge = null;
-          client.save();
           await sleep(delay);
           continue;
         }
@@ -1200,16 +1007,40 @@ async function main() {
           solution_nonce: solution.solution_nonce,
         });
         minted += 1;
+        consecutiveRecoverableFailures = 0;
         client.state.last_mint = result;
         client.state.challenge = null;
         client.state.mining = null;
         client.save();
         log("success", "mint/claim accepted", result);
         log("success", "mint progress", { minted, target, remaining: Math.max(0, target - minted) });
+        if (minted < target) {
+          const delay = postMintDelayMs();
+          log("info", "post-mint cooldown", { delay_ms: delay });
+          await sleep(delay);
+        }
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
           log("warn", "session invalid; rerun login/complete-login, then rerun mine to resume");
           throw err;
+        }
+        if (isRecoverableMineError(err)) {
+          consecutiveRecoverableFailures += 1;
+          const delay = mineRetryDelayMs(consecutiveRecoverableFailures, err);
+          log("warn", `temporary mint failure; dropping challenge and continuing in ${delay}ms`, {
+            failures: consecutiveRecoverableFailures,
+            minted,
+            target,
+            remaining: Math.max(0, target - minted),
+            error: err.message,
+            code: errorCode(err),
+            status: err.status,
+          });
+          client.state.challenge = null;
+          client.state.mining = null;
+          client.save();
+          await sleep(delay);
+          continue;
         }
         log("warn", "mint failed; dropping challenge and continuing with a fresh one", { error: err.message, code: err.code, status: err.status });
         client.state.challenge = null;
@@ -1235,7 +1066,6 @@ async function main() {
 
 Options:
   --state .rpow-cli-state.json
-  --proxy host:port@user:pass
   --timeout 20000
   --retries 5
   --log-every-ms 5000
