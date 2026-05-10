@@ -1,0 +1,42 @@
+name: RPOW Auto Miner
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install gcc
+        run: sudo apt-get install -y gcc
+
+      - name: Build native C miner
+        run: |
+          chmod +x build-native.sh
+          ./build-native.sh
+          cp rpow-native-miner rpow-native-miner.exe
+
+      - name: Restore session
+        run: echo '${{ secrets.RPOW_STATE }}' > .rpow-cli-state.json
+
+      - name: Cek session
+        run: node rpow-cli.js me
+
+      - name: Run miner
+        run: node rpow-cli.js mine --count 50 --workers 4 --engine native --timeout 60000 --retries 10
+
+      - name: Cek saldo akhir
+        if: always()
+        run: node rpow-cli.js me
