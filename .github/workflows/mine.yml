@@ -2,13 +2,13 @@ name: RPOW Auto Miner
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
   mine:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 28
 
     steps:
       - name: Checkout repo
@@ -34,8 +34,14 @@ jobs:
       - name: Cek session
         run: node rpow-cli.js me
 
-      - name: Run miner
-        run: node rpow-cli.js mine --count 50 --workers 4 --engine native --timeout 60000 --retries 10
+      - name: Run miner loop
+        run: |
+          while true; do
+            node rpow-cli.js mine --count 10 --workers 4 --engine native --timeout 60000 --retries 5
+            sleep 2
+          done &
+          sleep 1500
+          kill %1 || true
 
       - name: Cek saldo akhir
         if: always()
